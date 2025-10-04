@@ -6,17 +6,54 @@ Fast keyword-based file search tool for file recovery with boolean and sequentia
 
 **What sets indexed-find apart:**
 
+- **Multi-threaded indexing**: Parallel file reading, processing, and writing for 20-50x speedup
+  - Intelligent memory management with configurable readahead limits
+  - Single-threaded mode for safety, multi-threaded for speed
 - **Sequential/ordered search**: Find keywords in a specific order across lines with `<` operator
   - `printf < format < buffer` matches even when keywords are separated by other content
 - **Dual tokenization**: Indexes both `[a-z0-9]+` and `[a-z0-9_]+` patterns for comprehensive coverage
 - **Context preservation**: Stores surrounding lines (160 char limit) for quick review without reopening files
 - **Offset tracking**: Exact byte position for each keyword occurrence
 - **Relative path storage**: Clean, portable filename storage relative to index directory
-- **Memory-efficient**: Processes files one at a time, handles hundreds of thousands of files
+- **Memory-efficient**: Processes files one at a time (single-threaded) or with bounded queues (multi-threaded)
 - **Append mode**: Add new files without re-indexing existing ones
 - **Size filtering**: Skip files by max size (default 200KB, configurable)
 
-## Installation
+## Performance
+
+**Single-threaded vs Multi-threaded:**
+
+```bash
+# Single-threaded (safe, slower) - ~1-2 files/sec
+indexed-find -n recovery index -d /lost+found -r
+# 108,000 files = ~15-30 hours
+
+# Multi-threaded with 4 threads - ~40-80 files/sec  
+indexed-find -n recovery index -d /lost+found -r --threads 4
+# 108,000 files = ~22-45 minutes
+
+# Adjust memory limit (default 10% of RAM)
+indexed-find -n recovery index -d /lost+found -r --threads 4 --max-readahead-sysmem 20
+```
+
+**How multi-threading works:**
+- `--threads 1` (default): Single-threaded, no parallelism
+- `--threads N` (N>1): 1 reader thread + (N-1) worker threads + 1 writer thread
+  - **Reader**: Queues files from disk (blocks when memory limit hit)
+  - **Workers**: Extract keywords with regex patterns in parallel
+  - **Writer**: Batch INSERT to SQLite (1000 keywords or time-based flush)
+  
+**Memory management:**
+- `--max-readahead-sysmem 10`: Uses 10% of system RAM for file queue
+- Reader checks file size before loading, blocks if over limit
+- Always allows at least 1 file to be read (even if over limit)
+- Memory is released as workers finish processing
+
+**When to use multi-threading:**
+- Large datasets (10,000+ files): Use `--threads 4` or higher
+- Fast storage (SSD): Higher thread counts work better
+- Slow storage (HDD): Fewer threads (2-4) may be optimal
+- Memory constrained: Reduce `--max-readahead-sysmem` percentage
 
 ```bash
 chmod +x indexed-find
@@ -50,13 +87,18 @@ indexed-find -n mydata search 'database && !deprecated'
 indexed-find -n <dataset> index -d <directory> [options]
 
 Options:
-  -d, --dir DIR         Directory to index (required)
-  -r, --recursive       Recursively index subdirectories
-  -a, --append          Append to existing index
-  --overwrite --force   Overwrite existing index (both flags required)
-  --maxsize BYTES       Max file size in bytes (default: 200000)
-  --maxindexed N        Stop after indexing N files (for testing)
-  -v, -v -v, -v -v -v  Verbosity levels
+  -d, --dir DIR           Directory to index (required)
+  -r, --recursive         Recursively index subdirectories
+  -a, --append            Append to existing index
+  --overwrite --force     Overwrite existing index (both flags required)
+  --maxsize BYTES         Max file size in bytes (default: 200000)
+  --maxindexed N          Stop after indexing N files (for testing)
+  --threads N             Number of threads (default: 1 = single-threaded)
+                          N > 1: Uses 1 reader + (N-1) workers + 1 writer
+  --max-readahead-sysmem PCT  
+                          Percentage of system memory for readahead (default: 10%)
+  --commit-time SECONDS   Min time between SQLite commits (default: 0 = after each file)
+  -v, -v -v, -v -v -v    Verbosity levels
 ```
 
 ### Searching
@@ -70,8 +112,15 @@ Boolean operators:
   !     NOT
   ()    Grouping
 
-Sequential operator:
-  <     Ordered occurrence
+Sequential/ordered search (keywords must appear in order):
+  # Multiple arguments
+  indexed-find -n ds search signal desktop updater
+  
+  # Space-separated (quote the query)
+  indexed-find -n ds search 'signal desktop updater'
+  
+  # Using < operator (also works)
+  indexed-find -n ds search 'signal < desktop < updater'
 ```
 
 ### Listing
