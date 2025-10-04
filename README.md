@@ -1,6 +1,6 @@
 # indexed-find
 
-Fast keyword-based file search tool with boolean, sequential, and time-ordered queries.
+Fast keyword-based file search tool with boolean, sequential, and time-ordered queries (coded in python).
 
 (ie. Aside from booleans, it can do searches for "a b c" as well as results where "b" comes after "a" and "c" comes after "b". See below.)
 
