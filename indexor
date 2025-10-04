@@ -462,8 +462,8 @@ def main():
     DEF_MAXSIZE = 200000
     
     parser = argparse.ArgumentParser(description='Index and search files for recovery')
-    parser.add_argument('-n', '--name', required=True, help='Dataset name')
-    parser.add_argument('command', choices=['index', 'search'], help='Command to run')
+    parser.add_argument('-n', '--dataset-name', required=True, help='Dataset name')
+    parser.add_argument('command', nargs='?', choices=['index', 'search'], help='Command to run')
     parser.add_argument('query', nargs='?', help='Search query')
     parser.add_argument('-d', '--dir', help='Directory to index (required for index command)')
     parser.add_argument('-r', '--recursive', action='store_true', help='Recursively index subdirectories')
@@ -478,10 +478,41 @@ def main():
                        help='Stop after indexing N files (for testing)')
     parser.add_argument('--debug', action='store_true',
                        help='Show debug information for searches')
+    parser.add_argument('-l', '--list-files', action='store_true',
+                       help='List all files in the index')
+    parser.add_argument('-k', '--list-keywords', action='store_true',
+                       help='List all keywords in the index')
     
     args = parser.parse_args()
     
-    db_path = os.path.expanduser(f'~/.cache/indexor/ds/{args.name}/index.db')
+    db_path = os.path.expanduser(f'~/.cache/indexor/ds/{args.dataset_name}/index.db')
+    
+    # Handle list operations
+    if args.list_files:
+        if not os.path.exists(db_path):
+            print(f"Index {args.dataset_name} does not exist")
+            sys.exit(1)
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute('SELECT DISTINCT filename FROM keywords ORDER BY filename')
+        for row in cursor.fetchall():
+            print(row[0])
+        conn.close()
+        return
+    
+    if args.list_keywords:
+        if not os.path.exists(db_path):
+            print(f"Index {args.dataset_name} does not exist")
+            sys.exit(1)
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute('SELECT DISTINCT keyword FROM keywords ORDER BY keyword')
+        for row in cursor.fetchall():
+            print(row[0])
+        conn.close()
+        return
+    
+    if not args.command:
+        print("Error: command required (index or search) unless using -l or -k")
+        sys.exit(1)
     
     if args.command == 'index':
         if not args.dir:
