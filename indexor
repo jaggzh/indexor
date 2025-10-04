@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""
+indexed-find: Fast keyword-based file search with boolean and sequential queries
+"""
+
+import sqlite3
+import re
+import os
+import sys
+from pathlib import Path
+from typing import List, Tuple, Set
+import argparse
+
+class BooleanParser:
+    """Parse and evaluate boolean expressions"""
+    
+    def __init__(self, keywords: Set[str]):
+        self.keywords = keywords
+    
+    def parse(self, expr: str) -> bool:
+        """Parse boolean expression with &&, ||, (), and ! operators"""
+        expr = expr.strip()
+        
+        # Handle parentheses recursively
+        while '(' in expr:
+            # Find innermost parentheses
+            start = expr.rfind('(')
+            end = expr.find(')', start)
+            if end == -1:
+                raise ValueError("Mismatched parentheses")
+            
+            inner = expr[start+1:end]
+            result = self.parse(inner)
+            expr = expr[:start] + str(result) + expr[end+1:]
+        
+        # Handle OR (lower precedence)
+        if '||' in expr:
+            parts = expr.split('||')
+            return any(self.parse(p.strip()) for p in parts)
+        
+        # Handle AND (higher precedence)
+        if '&&' in expr:
+            parts = expr.split('&&')
+            return all(self.parse(p.strip()) for p in parts)
+        
+        # Handle NOT
+        if expr.startswith('!'):
+            return not self.parse(expr[1:].strip())
+        
+        # Base case: check if keyword exists
+        if expr in ('True', 'False'):
+            return expr == 'True'
+        
+        return expr.strip().lower() in self.keywords
+
+
+class Indexer:
+    """Index files for fast keyword search"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.conn = sqlite3.connect(db_path)
+        self.create_tables()
+        self.stats = {'total': 0, 'indexed': 0, 'skipped': 0}
+        self.verbosity = 0
+    
+    def create_tables(self):
+        """Create database schema"""
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS keywords (
+                id INTEGER PRIMARY KEY,
+                keyword TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                offset INTEGER NOT NULL,
+                prior_line TEXT,
+                match_line TEXT,
+                next_line TEXT
+            )
+        ''')
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_keyword ON keywords(keyword)')
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_filename ON keywords(filename)')
+        self.conn.commit()
+    
+    def extract_keywords(self, text: str) -> Set[str]:
+        """Extract keywords using both patterns"""
+        keywords = set()
+        
+        # Pattern 1: [a-z0-9]+
+        for match in re.finditer(r'[a-z0-9]+', text, re.IGNORECASE):
+            kw = match.group(0).lower()
+            if len(kw) <= 40:
+                keywords.add(kw)
+        
+        # Pattern 2: [a-z0-9_]+
+        for match in re.finditer(r'[a-z0-9_]+', text, re.IGNORECASE):
+            kw = match.group(0).lower()
+            if len(kw) <= 40:
+                keywords.add(kw)
+        
+        return keywords
+    
+    def get_context(self, content: bytes, offset: int) -> Tuple[str, str, str]:
+        """Extract prior, current, and next line with 160 char limits"""
+        try:
+            text = content.decode('utf-8', errors='ignore')
+        except:
+            return '', '', ''
+        
+        # Find line boundaries
+        line_start = text.rfind('\n', 0, offset)
+        if line_start == -1:
+            line_start = 0
+        else:
+            line_start += 1
+        
+        line_end = text.find('\n', offset)
+        if line_end == -1:
+            line_end = len(text)
+        
+        current_line = text[line_start:line_end]
+        
+        # Prior line
+        prior_line = ''
+        if line_start > 0:
+            prior_start = text.rfind('\n', 0, line_start - 1)
+            if prior_start == -1:
+                prior_start = 0
+            else:
+                prior_start += 1
+            
+            prior_text = text[prior_start:line_start - 1]
+            if len(prior_text) > 160:
+                prior_line = prior_text[-160:]
+            else:
+                prior_line = prior_text
+        
+        # Next line
+        next_line = ''
+        if line_end < len(text) - 1:
+            next_start = line_end + 1
+            next_end = text.find('\n', next_start)
+            if next_end == -1:
+                next_end = len(text)
+            
+            next_text = text[next_start:next_end]
+            if len(next_text) > 160:
+                next_line = next_text[:160]
+            else:
+                next_line = next_text
+        
+        # Limit current line
+        if len(current_line) > 160:
+            # Find where match is in current line
+            rel_offset = offset - line_start
+            if rel_offset < 160:
+                current_line = current_line[:160]
+            else:
+                current_line = current_line[rel_offset-80:rel_offset+80]
+        
+        return prior_line, current_line, next_line
+    
+    def index_file(self, filepath: str):
+        """Index a single file (deprecated - use index_file_with_name)"""
+        self.index_file_with_name(filepath, filepath)
+    
+    def is_indexed(self, filepath: str) -> bool:
+        """Check if file is already indexed"""
+        cursor = self.conn.execute('''
+            SELECT COUNT(*) FROM keywords WHERE filename = ?
+        ''', (filepath,))
+        return cursor.fetchone()[0] > 0
+    
+    def index_directory(self, directory: str, maxsize: int = 200000, append: bool = False, recursive: bool = False, maxindexed: int = None):
+        """Index files in directory (non-recursive by default, processes one at a time)"""
+        # Normalize the base directory
+        base_dir = os.path.abspath(directory)
+        
+        if recursive:
+            # Recursive mode: walk through subdirectories
+            for root, dirs, files in os.walk(base_dir):
+                for filename in files:
+                    if maxindexed and self.stats['indexed'] >= maxindexed:
+                        print(f"\nReached max indexed limit: {maxindexed}")
+                        return
+                    filepath = os.path.join(root, filename)
+                    relative_path = os.path.relpath(filepath, base_dir)
+                    self._index_file_if_valid(filepath, relative_path, maxsize, append)
+        else:
+            # Non-recursive: only process files in the specified directory
+            try:
+                entries = os.listdir(base_dir)
+            except OSError as e:
+                print(f"Error reading directory {base_dir}: {e}", file=sys.stderr)
+                return
+            
+            for entry in entries:
+                if maxindexed and self.stats['indexed'] >= maxindexed:
+                    print(f"\nReached max indexed limit: {maxindexed}")
+                    return
+                filepath = os.path.join(base_dir, entry)
+                # Only process regular files, skip directories
+                if os.path.isfile(filepath):
+                    # Store just the filename (relative to base_dir)
+                    self._index_file_if_valid(filepath, entry, maxsize, append)
+        
+        # Print final summary
+        if self.verbosity == 0:
+            print(f"\rTotal:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']}")
+        else:
+            print(f"\rTotal:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']}")
+    
+    def _index_file_if_valid(self, filepath: str, relative_path: str, maxsize: int, append: bool):
+        """Helper to check and index a single file"""
+        self.stats['total'] += 1
+        
+        # Update progress 
+        if self.verbosity == 0:
+            print(f"\rTotal:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']}", end='', flush=True)
+        else:
+            # Print counts inline
+            print(f"\rTotal:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']}", end=' ', flush=True)
+        
+        # Check file size
+        try:
+            file_size = os.path.getsize(filepath)
+        except OSError:
+            self.stats['skipped'] += 1
+            if self.verbosity >= 2:
+                print(f"Skipping {relative_path} (error reading)")
+            elif self.verbosity >= 1:
+                print()  # newline after count
+            return
+        
+        # Skip 0 byte files
+        if file_size == 0:
+            self.stats['skipped'] += 1
+            if self.verbosity >= 2:
+                print(f"Skipping {relative_path} (0 bytes)")
+            elif self.verbosity >= 1:
+                print()  # newline after count
+            return
+        
+        # Skip files exceeding maxsize
+        if file_size > maxsize:
+            self.stats['skipped'] += 1
+            if self.verbosity >= 2:
+                print(f"Skipping {relative_path} (size: {file_size} > {maxsize})")
+            elif self.verbosity >= 1:
+                print()  # newline after count
+            return
+        
+        # Skip already indexed files when appending
+        if append and self.is_indexed(relative_path):
+            self.stats['skipped'] += 1
+            if self.verbosity >= 2:
+                print(f"Skipping {relative_path} (already indexed)")
+            elif self.verbosity >= 1:
+                print()  # newline after count
+            return
+        
+        if self.verbosity >= 1:
+            print(f"Indexing: {relative_path} ({file_size} bytes)")
+        
+        self.stats['indexed'] += 1
+        self.index_file_with_name(filepath, relative_path)
+    
+    def index_file_with_name(self, filepath: str, stored_name: str):
+        """Index a file but store it with the given name"""
+        try:
+            with open(filepath, 'rb') as f:
+                content = f.read()
+            
+            text = content.decode('utf-8', errors='ignore')
+            
+            # Find all keyword occurrences with offsets
+            for pattern in [r'[a-z0-9]+', r'[a-z0-9_]+']:
+                for match in re.finditer(pattern, text, re.IGNORECASE):
+                    keyword = match.group(0).lower()
+                    if len(keyword) <= 40:
+                        offset = match.start()
+                        prior, current, next_line = self.get_context(content, offset)
+                        
+                        self.conn.execute('''
+                            INSERT INTO keywords (keyword, filename, offset, prior_line, match_line, next_line)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        ''', (keyword, stored_name, offset, prior, current, next_line))
+            
+            self.conn.commit()
+        except Exception as e:
+            print(f"Error indexing {filepath}: {e}", file=sys.stderr)
+
+
+class Searcher:
+    """Search indexed files"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path)
+        # Color codes for highlighting
+        self.HIGHLIGHT = '\033[35;1m'  # bright magenta
+        self.RESET = '\033[0m'
+    
+    def highlight_keywords(self, text: str, keywords: List[str]) -> str:
+        """Highlight keywords in text"""
+        if not text:
+            return text
+        
+        result = text
+        # Sort keywords by length (longest first) to avoid partial matches
+        sorted_keywords = sorted(keywords, key=len, reverse=True)
+        
+        for keyword in sorted_keywords:
+            # Case-insensitive replacement while preserving original case
+            pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+            result = pattern.sub(f'{self.HIGHLIGHT}\\g<0>{self.RESET}', result)
+        
+        return result
+    
+    def boolean_search(self, query: str, debug: bool = False) -> List[Tuple]:
+        """Search using boolean logic"""
+        # Extract all keywords from query (lowercase for comparison)
+        potential_keywords = re.findall(r'\w+', query)
+        keywords_to_check = [kw.lower() for kw in potential_keywords 
+                            if kw.lower() not in ('and', 'or', 'not')]
+        
+        if debug:
+            print(f"Debug: Searching for keywords: {keywords_to_check}", file=sys.stderr)
+        
+        if not keywords_to_check:
+            return []
+        
+        # Get all files that contain at least one keyword
+        placeholders = ','.join('?' * len(keywords_to_check))
+        cursor = self.conn.execute(f'''
+            SELECT DISTINCT filename FROM keywords WHERE keyword IN ({placeholders})
+        ''', keywords_to_check)
+        
+        files = [row[0] for row in cursor.fetchall()]
+        
+        if debug:
+            print(f"Debug: Found {len(files)} files with at least one keyword", file=sys.stderr)
+        
+        # For each file, check if it matches the boolean expression
+        results = []
+        for filename in files:
+            # Get all keywords in this file
+            cursor = self.conn.execute('''
+                SELECT DISTINCT keyword FROM keywords WHERE filename = ?
+            ''', (filename,))
+            file_keywords = set(row[0] for row in cursor.fetchall())
+            
+            if debug:
+                matching = [kw for kw in keywords_to_check if kw in file_keywords]
+                print(f"Debug: {filename} has keywords: {matching}", file=sys.stderr)
+            
+            # Evaluate boolean expression
+            parser = BooleanParser(file_keywords)
+            try:
+                if parser.parse(query):
+                    if debug:
+                        print(f"Debug: {filename} MATCHES query", file=sys.stderr)
+                    
+                    # Get sample matches for the positive keywords (not negated)
+                    positive_keywords = [kw for kw in keywords_to_check if not query.count(f'!{kw}')]
+                    if not positive_keywords:
+                        positive_keywords = keywords_to_check
+                    
+                    placeholders_pos = ','.join('?' * len(positive_keywords))
+                    cursor = self.conn.execute(f'''
+                        SELECT keyword, offset, prior_line, match_line, next_line
+                        FROM keywords WHERE filename = ? AND keyword IN ({placeholders_pos})
+                        LIMIT 3
+                    ''', (filename,) + tuple(positive_keywords))
+                    
+                    for row in cursor.fetchall():
+                        results.append((filename,) + row)
+            except Exception as e:
+                print(f"Error parsing query: {e}", file=sys.stderr)
+                return []
+        
+        return results
+    
+    def sequential_search(self, query: str, debug: bool = False) -> List[Tuple]:
+        """Search for keywords in order using < operator"""
+        keywords = [kw.strip().lower() for kw in query.split('<')]
+        
+        if debug:
+            print(f"Debug: Sequential search for: {keywords}", file=sys.stderr)
+        
+        if len(keywords) < 2:
+            return []
+        
+        # Get files containing all keywords
+        placeholders = ','.join('?' * len(keywords))
+        cursor = self.conn.execute(f'''
+            SELECT filename FROM keywords WHERE keyword IN ({placeholders})
+            GROUP BY filename HAVING COUNT(DISTINCT keyword) = ?
+        ''', keywords + [len(keywords)])
+        
+        files = [row[0] for row in cursor.fetchall()]
+        
+        if debug:
+            print(f"Debug: Found {len(files)} files with all keywords", file=sys.stderr)
+        
+        # Check ordering in each file
+        results = []
+        for filename in files:
+            cursor = self.conn.execute('''
+                SELECT keyword, offset, prior_line, match_line, next_line
+                FROM keywords WHERE filename = ? AND keyword IN ({})
+                ORDER BY offset
+            '''.format(placeholders), (filename,) + tuple(keywords))
+            
+            occurrences = cursor.fetchall()
+            
+            # Check if keywords appear in order
+            keyword_positions = {kw: [] for kw in keywords}
+            for kw, offset, *context in occurrences:
+                keyword_positions[kw].append((offset, context))
+            
+            # Find valid sequences
+            if self.check_sequence(keyword_positions, keywords):
+                if debug:
+                    print(f"Debug: {filename} has keywords in correct sequence", file=sys.stderr)
+                
+                # Add first occurrence of each keyword
+                for kw in keywords:
+                    if keyword_positions[kw]:
+                        offset, context = keyword_positions[kw][0]
+                        results.append((filename, kw, offset) + tuple(context))
+        
+        return results
+    
+    def check_sequence(self, positions: dict, keywords: List[str]) -> bool:
+        """Check if keywords appear in sequence"""
+        # For each occurrence of first keyword, check if subsequent keywords follow
+        for first_offset, _ in positions[keywords[0]]:
+            last_offset = first_offset
+            valid = True
+            
+            for kw in keywords[1:]:
+                # Find next occurrence of this keyword after last_offset
+                found = False
+                for offset, _ in positions[kw]:
+                    if offset > last_offset:
+                        last_offset = offset
+                        found = True
+                        break
+                
+                if not found:
+                    valid = False
+                    break
+            
+            if valid:
+                return True
+        
+        return False
+
+
+def main():
+    DEF_MAXSIZE = 200000
+    
+    parser = argparse.ArgumentParser(description='Index and search files for recovery')
+    parser.add_argument('-n', '--name', required=True, help='Dataset name')
+    parser.add_argument('command', choices=['index', 'search'], help='Command to run')
+    parser.add_argument('query', nargs='?', help='Search query')
+    parser.add_argument('-d', '--dir', help='Directory to index (required for index command)')
+    parser.add_argument('-r', '--recursive', action='store_true', help='Recursively index subdirectories')
+    parser.add_argument('-a', '--append', action='store_true', help='Append to existing index')
+    parser.add_argument('--overwrite', action='store_true', help='Overwrite existing index (requires --force)')
+    parser.add_argument('--force', action='store_true', help='Force overwrite (requires --overwrite)')
+    parser.add_argument('--maxsize', type=int, default=DEF_MAXSIZE, 
+                       help=f'Maximum file size in bytes (default: {DEF_MAXSIZE})')
+    parser.add_argument('-v', '--verbose', action='count', default=0,
+                       help='Increase verbosity (-v, -v -v, or -v -v -v)')
+    parser.add_argument('--maxindexed', type=int, default=None,
+                       help='Stop after indexing N files (for testing)')
+    parser.add_argument('--debug', action='store_true',
+                       help='Show debug information for searches')
+    
+    args = parser.parse_args()
+    
+    db_path = os.path.expanduser(f'~/.cache/indexor/ds/{args.name}/index.db')
+    
+    if args.command == 'index':
+        if not args.dir:
+            print("Error: -d/--dir is required for index command")
+            sys.exit(1)
+        
+        # Check if index exists
+        if os.path.exists(db_path):
+            if args.overwrite and args.force:
+                os.remove(db_path)
+                print(f"Overwriting existing index: {db_path}")
+            elif args.append:
+                print(f"Appending to existing index: {db_path}")
+            else:
+                print(f"Index {args.name} already exists. Use -a to 'append' and '--overwrite --force' to overwrite.")
+                sys.exit(1)
+        
+        indexer = Indexer(db_path)
+        indexer.verbosity = args.verbose
+        indexer.index_directory(args.dir, args.maxsize, args.append, args.recursive, args.maxindexed)
+        print(f"Indexing complete. Database: {db_path}")
+    
+    elif args.command == 'search':
+        if not args.query:
+            print("Error: search query required")
+            sys.exit(1)
+            
+        searcher = Searcher(db_path)
+        
+        # Determine query type
+        if '<' in args.query:
+            results = searcher.sequential_search(args.query, debug=args.debug)
+        else:
+            results = searcher.boolean_search(args.query, debug=args.debug)
+        
+        if not results:
+            print("No matches found")
+            return
+        
+        # Extract keywords for highlighting (excluding boolean operators and negations)
+        highlight_keywords = []
+        if '<' in args.query:
+            highlight_keywords = [kw.strip().lower() for kw in args.query.split('<')]
+        else:
+            # Extract words from boolean query, excluding operators and negated terms
+            tokens = re.findall(r'!?\w+', args.query)
+            for token in tokens:
+                if token.lower() not in ('and', 'or', 'not') and not token.startswith('!'):
+                    highlight_keywords.append(token.lower())
+        
+        # Display results
+        for result in results:
+            filename = result[0]
+            keyword = result[1]
+            offset = result[2]
+            prior = result[3]
+            match_line = result[4]
+            next_line = result[5]
+            
+            print(f"\n{filename}:{offset} ({keyword})")
+            if prior:
+                print(f"  {searcher.highlight_keywords(prior, highlight_keywords)}")
+            print(f"→ {searcher.highlight_keywords(match_line, highlight_keywords)}")
+            if next_line:
+                print(f"  {searcher.highlight_keywords(next_line, highlight_keywords)}")
+
+
+if __name__ == '__main__':
+    main()
