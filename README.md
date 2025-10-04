@@ -1,6 +1,10 @@
 # indexed-find
 
-Fast keyword-based file search tool for file recovery with boolean and sequential queries.
+Fast keyword-based file search tool with boolean, sequential, and time-ordered queries.
+
+(ie. Aside from booleans, it can do searches for "a b c" as well as results where "b" comes after "a" and "c" comes after "b". See below.)
+
+I vibed this up with Claude (22 versions!) because, after file-system corruption, I kept having to grep through thousands of files, and really could use some of these methods of searching without an elaborate file indexing system. Just a simple tool which caches the database in ~/.cache/indexor/ds/foobar (<-- dataset) when you use `indexor -n foobar ...`
 
 ## Unique Features
 
