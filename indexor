@@ -14,6 +14,7 @@ import psutil
 from pathlib import Path
 from typing import List, Tuple, Set, Optional
 import argparse
+from bansi import *
 
 class BooleanParser:
     """Parse and evaluate boolean expressions"""
@@ -65,25 +66,34 @@ class Indexer:
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        
+        # Performance optimizations for SMR drives
+        self.conn.execute('PRAGMA journal_mode=WAL')
+        self.conn.execute('PRAGMA synchronous=NORMAL')
+        self.conn.execute('PRAGMA cache_size=-4000000')  # 4GB cache
+        self.conn.execute('PRAGMA temp_store=MEMORY')
+        self.conn.execute('PRAGMA mmap_size=268435456')  # 256MB mmap
+        
         self.create_tables()
-        self.stats = {'total': 0, 'indexed': 0, 'skipped': 0}
+        self.stats = {'total': 0, 'indexed': 0, 'skipped': 0, 'bytes': 0}
         self.verbosity = 0
         self.commit_time = commit_time
         self.last_commit = time.time()
         self.threads = threads
         self.max_readahead_bytes = int(psutil.virtual_memory().total * (max_readahead_pct / 100))
         self.stats_lock = threading.Lock()
+        self.start_time = None
 
-        self.conn.execute('PRAGMA journal_mode=WAL')  # CRITICAL for SMR
-        self.conn.execute('PRAGMA synchronous=NORMAL')  # Faster, still safe
-        self.conn.execute('PRAGMA cache_size=-4000000')  # 4GB cache (negative = KB)
-        self.conn.execute('PRAGMA temp_store=MEMORY')
-        self.conn.execute('PRAGMA mmap_size=268435456')  # 256MB memory-mapped I/O
-
+    def finalize_indexes(self):
+        """Call after all indexing complete"""
+        print("Building indexes (this may take a while on SMR drives)...")
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_keyword ON keywords(keyword)')
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_filename ON keywords(filename)')
+        self.conn.commit()
     
     def create_tables(self):
         """Create database schema"""
-        self.conn.execute('PRAGMA page_size=65536')  # Larger pages (default is 4096)
+        self.conn.execute('PRAGMA journal_mode=WAL')
         self.conn.execute('''
             CREATE TABLE IF NOT EXISTS keywords (
                 id INTEGER PRIMARY KEY,
@@ -98,6 +108,28 @@ class Indexer:
         self.conn.execute('CREATE INDEX IF NOT EXISTS idx_keyword ON keywords(keyword)')
         self.conn.execute('CREATE INDEX IF NOT EXISTS idx_filename ON keywords(filename)')
         self.conn.commit()
+    
+    def is_binary_file(self, content: bytes, sample_size: int = 8192) -> bool:
+        """
+        Detect if file content is binary by checking for null bytes
+        and high proportion of non-text bytes in sample
+        """
+        sample = content[:sample_size]
+        
+        # Quick check: null bytes are strong indicator of binary
+        if b'\x00' in sample:
+            return True
+        
+        # Check for high proportion of non-printable characters
+        # Allow common whitespace: \t \n \r
+        text_chars = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)))
+        non_text = sum(1 for byte in sample if byte not in text_chars)
+        
+        # If more than 30% non-text characters, likely binary
+        if len(sample) > 0 and (non_text / len(sample)) > 0.3:
+            return True
+        
+        return False
     
     def extract_keywords(self, text: str) -> Set[str]:
         """Extract keywords using both patterns"""
@@ -191,8 +223,24 @@ class Indexer:
         ''', (filepath,))
         return cursor.fetchone()[0] > 0
     
+    def format_stats(self):
+        """Format stats with rates"""
+        if not self.start_time:
+            return f"Total:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']}"
+        
+        elapsed = time.time() - self.start_time
+        if elapsed < 0.1:
+            return f"Total:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']}"
+        
+        files_per_sec = self.stats['indexed'] / elapsed
+        mb_per_sec = (self.stats['bytes'] / elapsed) / (1024 * 1024)
+        
+        return f"Total:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']}, {files_per_sec:.1f} files/s, {mb_per_sec:.2f} MB/s"
+    
     def index_directory(self, directory: str, maxsize: int = 200000, append: bool = False, recursive: bool = False, maxindexed: int = None):
         """Index files in directory (non-recursive by default, processes one at a time)"""
+        self.start_time = time.time()
+        
         if self.threads == 1:
             self._index_directory_single_threaded(directory, maxsize, append, recursive, maxindexed)
         else:
@@ -202,38 +250,45 @@ class Indexer:
         """Original single-threaded implementation"""
         base_dir = os.path.abspath(directory)
         
-        if recursive:
-            for root, dirs, files in os.walk(base_dir):
-                for filename in files:
+        try:
+            if recursive:
+                for root, dirs, files in os.walk(base_dir):
+                    for filename in files:
+                        if maxindexed and self.stats['indexed'] >= maxindexed:
+                            print(f"\nReached max indexed limit: {maxindexed}")
+                            self.conn.commit()
+                            return
+                        filepath = os.path.join(root, filename)
+                        relative_path = os.path.relpath(filepath, base_dir)
+                        self._index_file_if_valid(filepath, relative_path, maxsize, append)
+            else:
+                try:
+                    entries = os.listdir(base_dir)
+                except OSError as e:
+                    print(f"Error reading directory {base_dir}: {e}", file=sys.stderr)
+                    return
+                
+                for entry in entries:
                     if maxindexed and self.stats['indexed'] >= maxindexed:
                         print(f"\nReached max indexed limit: {maxindexed}")
                         self.conn.commit()
                         return
-                    filepath = os.path.join(root, filename)
-                    relative_path = os.path.relpath(filepath, base_dir)
-                    self._index_file_if_valid(filepath, relative_path, maxsize, append)
-        else:
-            try:
-                entries = os.listdir(base_dir)
-            except OSError as e:
-                print(f"Error reading directory {base_dir}: {e}", file=sys.stderr)
-                return
-            
-            for entry in entries:
-                if maxindexed and self.stats['indexed'] >= maxindexed:
-                    print(f"\nReached max indexed limit: {maxindexed}")
-                    self.conn.commit()
-                    return
-                filepath = os.path.join(base_dir, entry)
-                if os.path.isfile(filepath):
-                    self._index_file_if_valid(filepath, entry, maxsize, append)
+                    filepath = os.path.join(base_dir, entry)
+                    if os.path.isfile(filepath):
+                        self._index_file_if_valid(filepath, entry, maxsize, append)
+        
+        except KeyboardInterrupt:
+            print(f"\n\nCtrl-C detected! Committing indexed data...")
+            self.conn.commit()
+            print(f"Graceful shutdown complete. {self.format_stats()}")
+            sys.exit(0)
         
         self.conn.commit()
         if self.verbosity == 0:
-            print(f"\rTotal:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']}")
+            print(f"\r{self.format_stats()}")
         else:
-            print(f"\rTotal:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']}")
-    
+            print(f"\r{self.format_stats()}")
+
     def _index_directory_multi_threaded(self, directory: str, maxsize: int, append: bool, recursive: bool, maxindexed: int):
         """Multi-threaded implementation with reader, workers, and writer"""
         base_dir = os.path.abspath(directory)
@@ -272,6 +327,8 @@ class Indexer:
                 
                 for filepath, relative_path in file_list:
                     if shutdown.is_set():
+                        if self.verbosity >= 1:
+                            print("Reader: Shutdown requested, stopping")
                         break
                     
                     with self.stats_lock:
@@ -306,6 +363,10 @@ class Indexer:
                     with queue_bytes_lock:
                         while queued_bytes[0] > self.max_readahead_bytes and queued_bytes[0] > 0:
                             queue_bytes_lock.release()
+                            if shutdown.is_set():
+                                if self.verbosity >= 1:
+                                    print("Reader: Shutdown during queue wait")
+                                return
                             time.sleep(0.01)
                             queue_bytes_lock.acquire()
                     
@@ -321,7 +382,7 @@ class Indexer:
                         with self.stats_lock:
                             self.stats['total'] += 1
                             if self.verbosity >= 1:
-                                print(f"\rTotal:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']} Reading: {relative_path} ({file_size} bytes)")
+                                print(f"\r{self.format_stats()} Reading: {relative_path} ({file_size} bytes)")
                         
                         if self.verbosity >= 1:
                             print(f"Reading: {relative_path} ({file_size} bytes)")
@@ -334,15 +395,30 @@ class Indexer:
             
             finally:
                 reader_done.set()
+                if self.verbosity >= 1:
+                    print("Reader: Complete")
         
         # Worker threads
         def worker():
             while not (reader_done.is_set() and work_queue.empty()):
+                if shutdown.is_set() and work_queue.empty():
+                    if self.verbosity >= 1:
+                        print(f"{threading.current_thread().name}: Shutdown, queue empty")
+                    break
+                
                 try:
                     filepath, content, relative_path, file_bytes = work_queue.get(timeout=0.1)
                     
                     try:
-                        text = content.decode('utf-8', errors='ignore')
+                        # Check if binary BEFORE trying to decode
+                        if self.is_binary_file(content):
+                            if self.verbosity >= 2:
+                                print(f"Skipping {relative_path} (binary file)")
+                            with self.stats_lock:
+                                self.stats['skipped'] += 1
+                            continue
+                        
+                        text = content.decode('utf-8', errors='strict')
                         
                         if self.verbosity >= 2:
                             print(f"Indexing: {relative_path}")
@@ -350,7 +426,7 @@ class Indexer:
                         for pattern in [r'[a-z0-9]+', r'[a-z0-9_]+']:
                             for match in re.finditer(pattern, text, re.IGNORECASE):
                                 keyword = match.group(0).lower()
-                                if len(keyword) <= 40:
+                                if 3 <= len(keyword) <= 40:
                                     offset = match.start()
                                     prior, current, next_line = self.get_context(content, offset)
                                     
@@ -358,9 +434,15 @@ class Indexer:
                         
                         with self.stats_lock:
                             self.stats['indexed'] += 1
+                            self.stats['bytes'] += file_bytes
                             if self.verbosity >= 1:
-                                print(f"\rTotal:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']} Indexed: {relative_path}")
+                                print(f"\r{self.format_stats()} Indexed: {relative_path}")
                     
+                    except UnicodeDecodeError:
+                        if self.verbosity >= 2:
+                            print(f"Skipping {relative_path} (invalid UTF-8)")
+                        with self.stats_lock:
+                            self.stats['skipped'] += 1
                     except Exception as e:
                         print(f"Error processing {filepath}: {e}", file=sys.stderr)
                         with self.stats_lock:
@@ -374,7 +456,8 @@ class Indexer:
                 except queue.Empty:
                     continue
             
-            workers_done.set()
+            if self.verbosity >= 1:
+                print(f"{threading.current_thread().name}: Complete")
         
         # Writer thread
         def writer():
@@ -382,12 +465,18 @@ class Indexer:
             last_flush = time.time()
             
             while not (workers_done.is_set() and write_queue.empty()):
+                if shutdown.is_set() and write_queue.empty():
+                    if self.verbosity >= 1:
+                        print("Writer: Shutdown, queue empty")
+                    break
+                
                 try:
                     item = write_queue.get(timeout=0.1)
                     batch.append(item)
                     
                     now = time.time()
                     if len(batch) >= 100000 or (self.commit_time > 0 and (now - last_flush) >= self.commit_time):
+                        commit_start = time.time()
                         if self.verbosity >= 2:
                             print(f"Storing Index: {len(batch)} keywords")
                         self.conn.executemany('''
@@ -395,6 +484,9 @@ class Indexer:
                             VALUES (?, ?, ?, ?, ?, ?)
                         ''', batch)
                         self.conn.commit()
+                        commit_time = time.time() - commit_start
+                        if self.verbosity >= 1:
+                            print(f"Commit took {bmag}{commit_time:.2f}{rst}s")
                         batch = []
                         last_flush = now
                     
@@ -404,6 +496,7 @@ class Indexer:
                     if batch:
                         now = time.time()
                         if self.commit_time == 0 or (now - last_flush) >= self.commit_time:
+                            commit_start = time.time()
                             if self.verbosity >= 2:
                                 print(f"Storing Index: {len(batch)} keywords")
                             self.conn.executemany('''
@@ -411,10 +504,15 @@ class Indexer:
                                 VALUES (?, ?, ?, ?, ?, ?)
                             ''', batch)
                             self.conn.commit()
+                            commit_time = time.time() - commit_start
+                            if self.verbosity >= 1:
+                                print(f"Commit took {commit_time:.2f}s")
                             batch = []
                             last_flush = now
             
+            # Final commit
             if batch:
+                commit_start = time.time()
                 if self.verbosity >= 2:
                     print(f"Storing Index: {len(batch)} keywords (final)")
                 self.conn.executemany('''
@@ -422,6 +520,12 @@ class Indexer:
                     VALUES (?, ?, ?, ?, ?, ?)
                 ''', batch)
                 self.conn.commit()
+                commit_time = time.time() - commit_start
+                if self.verbosity >= 1:
+                    print(f"Final commit took {commit_time:.2f}s")
+            
+            if self.verbosity >= 1:
+                print("Writer: Complete")
         
         # Start threads
         reader_thread = threading.Thread(target=reader, name="Reader")
@@ -439,37 +543,53 @@ class Indexer:
             while reader_thread.is_alive() or any(t.is_alive() for t in worker_threads) or writer_thread.is_alive():
                 if self.verbosity == 0:
                     with self.stats_lock:
-                        print(f"\rTotal:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']}", 
-                              end='', flush=True)
+                        print(f"\r{self.format_stats()}", end='', flush=True)
                 time.sleep(0.5)
         except KeyboardInterrupt:
-            print("\nShutdown requested, stopping threads...")
+            print("\n\nCtrl-C detected! Signaling threads to stop gracefully...")
             shutdown.set()
-            reader_thread.join(timeout=2)
+            
+            # Give threads time to finish current work
+            print("Waiting for reader to stop...")
+            reader_thread.join()
+            
+            print("Waiting for workers to finish current files...")
             for t in worker_threads:
-                t.join(timeout=2)
-            writer_thread.join(timeout=2)
-            sys.exit(1)
+                t.join()
+            
+            # Signal that all workers are done
+            workers_done.set()
+            
+            print("Waiting for writer to commit remaining data (may take a while)...")
+            writer_thread.join()
+            
+            elapsed = time.time() - start_time
+            print(f"\nGraceful shutdown complete. {self.format_stats()} (ran for {elapsed:.1f}s)")
+            sys.exit(0)
         
         reader_thread.join()
         for t in worker_threads:
             t.join()
+        
+        # Signal that all workers are done NOW (after they all finish)
+        workers_done.set()
+        
         writer_thread.join()
         
         elapsed = time.time() - start_time
         if self.verbosity == 0:
-            print(f"\rTotal:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']} (took {elapsed:.1f}s)")
+            print(f"\r{self.format_stats()} (took {elapsed:.1f}s)")
         else:
-            print(f"Total:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']} (took {elapsed:.1f}s)")
+            print(f"{self.format_stats()} (took {elapsed:.1f}s)")
     
     def _index_file_if_valid(self, filepath: str, relative_path: str, maxsize: int, append: bool):
         """Helper to check and index a single file"""
         self.stats['total'] += 1
         
         if self.verbosity == 0:
-            print(f"\rTotal:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']}", end='', flush=True)
+            print(f"\r{self.format_stats()}", end='', flush=True)
         else:
-            print(f"Total:{self.stats['total']}, Indexed:{self.stats['indexed']}, Skipped:{self.stats['skipped']}", end=' ', flush=True)
+            print(f"{self.format_stats()}", end=' ', flush=True)
         
         try:
             file_size = os.path.getsize(filepath)
@@ -509,6 +629,7 @@ class Indexer:
             print(f"Indexing: {relative_path} ({file_size} bytes)")
         
         self.stats['indexed'] += 1
+        self.stats['bytes'] += file_size
         self.index_file_with_name(filepath, relative_path)
     
     def index_file(self, filepath: str):
@@ -521,12 +642,18 @@ class Indexer:
             with open(filepath, 'rb') as f:
                 content = f.read()
             
-            text = content.decode('utf-8', errors='ignore')
+            # Check if binary
+            if self.is_binary_file(content):
+                if self.verbosity >= 2:
+                    print(f"Skipping {stored_name} (binary file)")
+                return
+            
+            text = content.decode('utf-8', errors='strict')
             
             for pattern in [r'[a-z0-9]+', r'[a-z0-9_]+']:
                 for match in re.finditer(pattern, text, re.IGNORECASE):
                     keyword = match.group(0).lower()
-                    if len(keyword) <= 40:
+                    if 3 <= len(keyword) <= 40:
                         offset = match.start()
                         prior, current, next_line = self.get_context(content, offset)
                         
@@ -536,6 +663,9 @@ class Indexer:
                         ''', (keyword, stored_name, offset, prior, current, next_line))
             
             self.maybe_commit()
+        except UnicodeDecodeError:
+            if self.verbosity >= 2:
+                print(f"Skipping {stored_name} (invalid UTF-8)")
         except Exception as e:
             print(f"Error indexing {filepath}: {e}", file=sys.stderr)
 
@@ -694,12 +824,12 @@ class Searcher:
 def main():
     DEF_MAXSIZE = 200000
     DEF_COMMIT_TIME = 0
-    DEF_THREADS = 1
+    DEF_THREADS = 2
     DEF_READAHEAD_PCT = 10
     
     parser = argparse.ArgumentParser(description='Index and search files for recovery')
     parser.add_argument('-n', '--dataset-name', required=True, help='Dataset name')
-    parser.add_argument('command', nargs='?', choices=['index', 'search'], help='Command to run')
+    parser.add_argument('command', nargs='?', choices=['index', 'search', 'finalize'], help='Command to run')
     parser.add_argument('query', nargs='*', help='Search query (multiple args for sequential search)')
     parser.add_argument('-d', '--dir', help='Directory to index (required for index command)')
     parser.add_argument('-r', '--recursive', action='store_true', help='Recursively index subdirectories')
@@ -752,8 +882,19 @@ def main():
         return
     
     if not args.command:
-        print("Error: command required (index or search) unless using -l or -k")
+        print("Error: command required (index, search, or finalize) unless using -l or -k")
         sys.exit(1)
+    
+    if args.command == 'finalize':
+        if not os.path.exists(db_path):
+            print(f"Error: Index {args.dataset_name} does not exist")
+            sys.exit(1)
+        
+        print(f"Finalizing index: {db_path}")
+        indexer = Indexer(db_path)
+        indexer.finalize_indexes()
+        print("Finalization complete.")
+        return
     
     if args.command == 'index':
         if not args.dir:
